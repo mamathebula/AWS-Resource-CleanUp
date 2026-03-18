@@ -63,6 +63,14 @@ aws cloudformation create-stack \
 - SNS topic (`CFT-Cleaner-Notifications`) with email subscription
 - EventBridge rule to trigger the Lambda on schedule
 
+| Resource | Type | Description |
+|----------|------|-------------|
+| Lambda Function | `AWS::Lambda::Function` | Python 3.13, 256 MB memory, 5 min timeout — runs the cleanup logic |
+| IAM Role | `AWS::IAM::Role` | EC2 describe/terminate and SNS publish permissions only |
+| SNS Topic | `AWS::SNS::Topic` | Sends email notifications when instances are terminated |
+| EventBridge Rule | `AWS::Events::Rule` | Triggers the Lambda on schedule (default every 30 minutes) |
+| Lambda Permission | `AWS::Lambda::Permission` | Allows EventBridge to invoke the Lambda function |
+
 ## Notifications
 
 The stack sends two types of email notifications:
