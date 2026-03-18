@@ -1,0 +1,1343 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Resource Cleanup Lambda Function with automated scheduling'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Cleanup Configuration"
+        Parameters:
+          - MinRunningTimeHours
+          - NotificationTimeHours
+          - ExcludeString
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+      - Label:
+          default: "Scheduling Configuration"
+        Parameters:
+          - ScheduleExpression
+          - LambdaTimeout
+
+Parameters:
+  MinRunningTimeHours:
+    Type: Number
+    Default: 8
+    Description: Minimum hours before deletion (applies to CloudFormation stacks, EC2 instances, and S3 buckets). Note - EBS volumes/snapshots and Elastic IPs are cleaned up immediately if unattached.
+    MinValue: 1
+    MaxValue: 168
+  
+  NotificationTimeHours:
+    Type: Number
+    Default: 4
+    Description: Hours before deletion to send notification
+    MinValue: 1
+    MaxValue: 24
+  
+  ExcludeString:
+    Type: String
+    Default: 'do-not-delete'
+    Description: Resources containing this string in name/tags will be protected
+  
+  NotificationEmail:
+    Type: String
+    Description: Email address for deletion notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+  
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(2 hours)'
+    Description: How often to run the cleanup (e.g., 'rate(1 hour)', 'rate(30 minutes)' or 'cron(0 * * * ? *)')
+    AllowedPattern: '^(rate\((1 (minute|hour|day)|([2-9]|[1-9][0-9]+) (minutes|hours|days))\)|cron\(.+\))$'
+    ConstraintDescription: Must be a valid EventBridge rate or cron expression (e.g., 'rate(1 hour)' or 'cron(0 * * * ? *)')
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 900
+    Description: Lambda function timeout in seconds
+    MinValue: 60
+    MaxValue: 900
+
+Resources:
+  # SNS Topic for notifications
+  CleanupNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: CFT-Cleaner-Notifications
+      DisplayName: CloudFormation Stack Cleanup Notifications
+      Tags:
+        - Key: ResourceName
+          Value: !Sub '${AWS::StackName}-${ExcludeString}'
+        - Key: Purpose
+          Value: 'AWS Resource Cleanup Notifications'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-${AWS::Region}-LambdaRole'
+      Tags:
+        - Key: ResourceName
+          Value: !Sub '${AWS::StackName}-${ExcludeString}'
+        - Key: Purpose
+          Value: 'AWS Resource Cleanup Lambda Execution Role'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ResourceCleanupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Core EC2 permissions
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DeleteVolume
+                  - ec2:DescribeSnapshots
+                  - ec2:DeleteSnapshot
+                  - ec2:DescribeImages
+                  - ec2:DescribeAddresses
+                  - ec2:ReleaseAddress
+                  - ec2:DescribeInstances
+                  - ec2:TerminateInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeTags
+                Resource: '*'
+              
+              # CloudFormation permissions
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DeleteStack
+                  - cloudformation:UpdateTerminationProtection
+                  - cloudformation:ListStacks
+                  - cloudformation:ListStackSets
+                  - cloudformation:DeleteStackSet
+                  - cloudformation:UpdateStack
+                  - cloudformation:UpdateStackSet
+                  - cloudformation:UpdateStackInstances
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:UpdateGeneratedTemplate
+                Resource: '*'
+              
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:DeleteBucket
+                  - s3:DeleteBucketPolicy
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketTagging
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                Resource:
+                  - 'arn:aws:s3:::*'
+                  - 'arn:aws:s3:::*/*'
+              
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sns:Unsubscribe
+                Resource: !Ref CleanupNotificationTopic
+              
+              # CloudWatch permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:DeleteDashboards
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - logs:DeleteLogGroup
+                Resource: '*'
+              
+              # Lambda permissions
+              - Effect: Allow
+                Action:
+                  - lambda:DeleteFunction
+                  - lambda:GetEventSourceMapping
+                  - lambda:RemovePermission
+                Resource: '*'
+              
+              # API Gateway permissions
+              - Effect: Allow
+                Action:
+                  - apigateway:DELETE
+                  - apigateway:GET
+                Resource: '*'
+              
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:ListTables
+                Resource: '*'
+              
+              # EventBridge permissions
+              - Effect: Allow
+                Action:
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                  - events:ListTargetsByRule
+                  - events:DescribeRule
+                Resource: '*'
+              
+              # CloudFront permissions
+              - Effect: Allow
+                Action:
+                  - cloudfront:DeleteDistribution
+                  - cloudfront:GetDistribution
+                  - cloudfront:UpdateDistribution
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:ListDistributions
+                  - cloudfront:DeleteOriginAccessControl
+                  - cloudfront:GetOriginAccessControl
+                  - cloudfront:ListOriginAccessControls
+                  - cloudfront:DeleteOriginRequestPolicy
+                  - cloudfront:GetOriginRequestPolicy
+                Resource: '*'
+              
+              # Step Functions permissions
+              - Effect: Allow
+                Action:
+                  - states:DescribeStateMachine
+                  - states:DeleteStateMachine
+                Resource: '*'
+              
+              # Cloud9 permissions
+              - Effect: Allow
+                Action:
+                  - cloud9:DeleteEnvironment
+                Resource: '*'
+              
+              # SES permissions
+              - Effect: Allow
+                Action:
+                  - ses:DeleteEmailIdentity
+                  - ses:DeleteConfigurationSetEventDestination
+                  - ses:DeleteConfigurationSet
+                Resource: '*'
+              
+              # RDS permissions
+              - Effect: Allow
+                Action:
+                  - rds:CreateDBSnapshot
+                  - rds:DeleteDBSnapshot
+                  - rds:DeleteDBInstance
+                  - rds:DescribeDBInstances
+                Resource: '*'
+              
+              # EKS permissions
+              - Effect: Allow
+                Action:
+                  - eks:DeleteCluster
+                Resource: '*'
+              
+              # ECR permissions
+              - Effect: Allow
+                Action:
+                  - ecr:DeleteRepository
+                Resource: '*'
+              
+              # SQS permissions
+              - Effect: Allow
+                Action:
+                  - sqs:SetQueueAttributes
+                  - sqs:DeleteQueue
+                Resource: '*'
+              
+              # STS permissions
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              
+              # IAM permissions
+              - Effect: Allow
+                Action:
+                  - iam:GetAccountPasswordPolicy
+                  - iam:DeleteAccessKey
+                  - iam:ListRoleTags
+                  - iam:GenerateServiceLastAccessedDetails
+                  - iam:ListServiceSpecificCredentials
+                  - iam:ListSigningCertificates
+                  - iam:DeleteServerCertificate
+                  - iam:ListRolePolicies
+                  - iam:DeleteOpenIDConnectProvider
+                  - iam:GetCredentialReport
+                  - iam:ListPolicies
+                  - iam:GetRole
+                  - iam:ListSAMLProviders
+                  - iam:GetPolicy
+                  - iam:ListEntitiesForPolicy
+                  - iam:DeleteRole
+                  - iam:GetOpenIDConnectProvider
+                  - iam:GetRolePolicy
+                  - iam:GenerateCredentialReport
+                  - iam:GetServiceLastAccessedDetails
+                  - iam:GetServiceLinkedRoleDeletionStatus
+                  - iam:ListInstanceProfilesForRole
+                  - iam:DeleteRolePolicy
+                  - iam:ListAttachedGroupPolicies
+                  - iam:ListPolicyTags
+                  - iam:DeleteAccountAlias
+                  - iam:ListAccessKeys
+                  - iam:DeleteInstanceProfile
+                  - iam:ListGroupPolicies
+                  - iam:ListCloudFrontPublicKeys
+                  - iam:GetSSHPublicKey
+                  - iam:ListRoles
+                  - iam:DeleteUser
+                  - iam:GetContextKeysForCustomPolicy
+                  - iam:DeleteVirtualMFADevice
+                  - iam:ListServerCertificateTags
+                  - iam:ListAccountAliases
+                  - iam:GetUser
+                  - iam:ListGroups
+                  - iam:DeleteServiceSpecificCredential
+                  - iam:DeleteSAMLProvider
+                  - iam:GetPolicyVersion
+                  - iam:DeleteGroup
+                  - iam:GetMFADevice
+                  - iam:ListServerCertificates
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:ListVirtualMFADevices
+                  - iam:ListSSHPublicKeys
+                  - iam:DetachRolePolicy
+                  - iam:GetAccountEmailAddress
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListOpenIDConnectProviderTags
+                  - iam:ListSAMLProviderTags
+                  - iam:GetAccountAuthorizationDetails
+                  - iam:DeleteCloudFrontPublicKey
+                  - iam:GetServerCertificate
+                  - iam:GetAccessKeyLastUsed
+                  - iam:DeleteUserPolicy
+                  - iam:GetUserPolicy
+                  - iam:ListGroupsForUser
+                  - iam:GetAccountName
+                  - iam:DeleteServiceLinkedRole
+                  - iam:GetGroupPolicy
+                  - iam:ListSTSRegionalEndpointsStatus
+                  - iam:GetServiceLastAccessedDetailsWithEntities
+                  - iam:ListPoliciesGrantingServiceAccess
+                  - iam:DeleteSSHPublicKey
+                  - iam:ListInstanceProfileTags
+                  - iam:ListMFADevices
+                  - iam:GetGroup
+                  - iam:GetContextKeysForPrincipalPolicy
+                  - iam:GetOrganizationsAccessReport
+                  - iam:GenerateOrganizationsAccessReport
+                  - iam:GetCloudFrontPublicKey
+                  - iam:ListAttachedUserPolicies
+                  - iam:GetSAMLProvider
+                  - iam:DeleteLoginProfile
+                  - iam:GetInstanceProfile
+                  - iam:ListUserPolicies
+                  - iam:ListInstanceProfiles
+                  - iam:ListPolicyVersions
+                  - iam:ListOpenIDConnectProviders
+                  - iam:ListUsers
+                  - iam:ListMFADeviceTags
+                  - iam:ListUserTags
+                  - iam:DeleteSigningCertificate
+                Resource: '*'
+              
+              # Route53 permissions
+              - Effect: Allow
+                Action:
+                  - route53:*
+                Resource: '*'
+              
+              # Secrets Manager permissions
+              - Effect: Allow
+                Action:
+                  - secretsmanager:ListSecrets
+                  - secretsmanager:GetRandomPassword
+                  - secretsmanager:BatchGetSecretValue
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:ListSecretVersionIds
+                Resource: '*'
+              
+              # Auto Scaling permissions
+              - Effect: Allow
+                Action:
+                  - autoscaling:*
+                  - autoscaling-plans:*
+                Resource: '*'
+              
+              # Elastic Load Balancing permissions
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:*
+                Resource: '*'
+              
+              # ECS permissions
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTaskSets
+                  - ecs:ListContainerInstances
+                  - ecs:ListServices
+                  - ecs:DescribeTasks
+                  - ecs:DescribeCapacityProviders
+                  - ecs:DeleteService
+                  - ecs:DeregisterContainerInstance
+                  - ecs:DeleteCluster
+                  - ecs:DeleteTaskSet
+                  - ecs:ListAttributes
+                  - ecs:DescribeServices
+                  - ecs:DescribeContainerInstances
+                  - ecs:ListClusters
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DeleteCapacityProvider
+                  - ecs:DescribeClusters
+                  - ecs:DeleteAccountSetting
+                  - ecs:DeleteAttributes
+                  - ecs:DeleteTaskDefinitions
+                  - ecs:DeregisterTaskDefinition
+                Resource: '*'
+              
+              # ElastiCache permissions
+              - Effect: Allow
+                Action:
+                  - elasticache:*
+                Resource: '*'
+              
+              # EFS permissions
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:*
+                Resource: '*'
+              
+              # Kafka (MSK) permissions
+              - Effect: Allow
+                Action:
+                  - kafka:*
+                Resource: '*'
+              
+              # KMS permissions
+              - Effect: Allow
+                Action:
+                  - kms:DeleteImportedKeyMaterial
+                  - kms:DeleteAlias
+                  - kms:DeleteCustomKeyStore
+                  - kms:ScheduleKeyDeletion
+                  - kms:ListKeys
+                  - kms:GetKeyPolicy
+                  - kms:DescribeCustomKeyStores
+                  - kms:DescribeKey
+                  - kms:ListKeyPolicies
+                  - kms:ListAliases
+                Resource: '*'
+              
+              # SSM permissions
+              - Effect: Allow
+                Action:
+                  - ssm:*
+                Resource: '*'
+              
+              # Cognito permissions
+              - Effect: Allow
+                Action:
+                  - cognito-identity:SetIdentityPoolRoles
+                  - cognito-idp:DeleteUserPoolDomain
+                Resource: '*'
+              
+              # Scheduler permissions
+              - Effect: Allow
+                Action:
+                  - scheduler:GetSchedule
+                Resource: '*'
+              
+              # Image Builder permissions
+              - Effect: Allow
+                Action:
+                  - imagebuilder:*
+                Resource: '*'
+              
+              # Additional RDS permissions
+              - Effect: Allow
+                Action:
+                  - rds:DeleteBlueGreenDeployment
+                  - rds:DescribeDBRecommendations
+                  - rds:DescribeGlobalClusters
+                  - rds:DescribeDBProxyTargets
+                  - rds:DownloadDBLogFilePortion
+                  - rds:DeleteDBInstanceAutomatedBackup
+                  - rds:DescribeReservedDBInstances
+                  - rds:DeleteDBProxy
+                  - rds:DeleteOptionGroup
+                  - rds:DescribeDBProxies
+                  - rds:DeleteDBCluster
+                  - rds:DescribeDBProxyEndpoints
+                  - rds:DescribeEvents
+                  - rds:ListTagsForResource
+                  - rds:DeleteDBClusterParameterGroup
+                  - rds:DeleteTenantDatabase
+                  - rds:DescribeEngineDefaultParameters
+                  - rds:DescribeDBSnapshots
+                  - rds:DescribeOrderableDBInstanceOptions
+                  - rds:DescribeCertificates
+                  - rds:DescribeOptionGroups
+                  - rds:DescribeDBEngineVersions
+                  - rds:DescribeDBSubnetGroups
+                  - rds:DescribeExportTasks
+                  - rds:DescribePendingMaintenanceActions
+                  - rds:DescribeDBParameterGroups
+                  - rds:DeleteEventSubscription
+                  - rds:DeleteDBProxyEndpoint
+                  - rds:DescribeDBParameters
+                  - rds:DescribeDBLogFiles
+                  - rds:DeleteDBClusterAutomatedBackup
+                  - rds:DescribeOptionGroupOptions
+                  - rds:DownloadCompleteDBLogFile
+                  - rds:DescribeDBClusterEndpoints
+                  - rds:DescribeDBClusterParameterGroups
+                  - rds:DescribeDBProxyTargetGroups
+                  - rds:DeleteGlobalCluster
+                  - rds:DescribeRecommendations
+                  - rds:DescribeSourceRegions
+                  - rds:DescribeBlueGreenDeployments
+                  - rds:DeleteDBSecurityGroup
+                  - rds:DescribeDbSnapshotTenantDatabases
+                  - rds:DescribeIntegrations
+                  - rds:DescribeTenantDatabases
+                  - rds:DeleteDBShardGroup
+                  - rds:DescribeRecommendationGroups
+                  - rds:DescribeDBInstances
+                  - rds:DescribeEngineDefaultClusterParameters
+                  - rds:DescribeEventCategories
+                  - rds:DescribeDBSnapshotAttributes
+                  - rds:DeleteDBClusterSnapshot
+                  - rds:DescribeDBInstanceAutomatedBackups
+                  - rds:DescribeDBClusterAutomatedBackups
+                  - rds:DeleteCustomDBEngineVersion
+                  - rds:DeleteDBSubnetGroup
+                  - rds:DescribeValidDBInstanceModifications
+                  - rds:DeleteDBParameterGroup
+                  - rds:DescribeDBShardGroups
+                  - rds:DeleteDBClusterEndpoint
+                  - rds:DescribeDBClusterSnapshotAttributes
+                  - rds:DescribeDBClusterParameters
+                  - rds:DescribeEventSubscriptions
+                  - rds:DescribeDBClusterSnapshots
+                  - rds:DescribeAccountAttributes
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBClusterBacktracks
+                  - rds:DescribeReservedDBInstancesOfferings
+                  - rds:DeleteIntegration
+                Resource: '*'
+              
+              # Additional Lambda permissions
+              - Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                  - lambda:DeleteAlias
+                  - lambda:DeleteFunctionCodeSigningConfig
+                  - lambda:InvokeFunctionUrl
+                  - lambda:InvokeFunction
+                  - lambda:DeleteCodeSigningConfig
+                  - lambda:DeleteLayerVersion
+                  - lambda:GetFunction
+                  - lambda:GetFunctionEventInvokeConfig
+                  - lambda:DeleteFunctionConcurrency
+                  - lambda:DeleteFunctionUrlConfig
+                  - lambda:GetFunctionConfiguration
+                  - lambda:DeleteProvisionedConcurrencyConfig
+                  - lambda:GetAccountSettings
+                  - lambda:GetPolicy
+                  - lambda:DeleteFunctionEventInvokeConfig
+                Resource: '*'
+
+  # Lambda Function
+  ResourceCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ResourceCleanupFunction
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 512
+      Tags:
+        - Key: ResourceName
+          Value: !Sub '${AWS::StackName}-${ExcludeString}'
+        - Key: Purpose
+          Value: 'AWS Resource Cleanup Automation'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+      Environment:
+        Variables:
+          MIN_RUNNING_TIME_HOURS: !Ref MinRunningTimeHours
+          NOTIFICATION_TIME_HOURS: !Ref NotificationTimeHours
+          SNS_TOPIC_ARN: !Ref CleanupNotificationTopic
+          EXCLUDE_STRING: !Ref ExcludeString
+          FORCE_DELETE: 'True'
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import time
+          import os
+          from botocore.exceptions import ClientError
+          import json
+
+          # Initialize AWS clients
+          ec2_client = boto3.client('ec2')
+          cf_client = boto3.client('cloudformation')
+          sns_client = boto3.client('sns')
+          cloudwatch = boto3.client('cloudwatch')
+
+          # Configuration from environment variables
+          MIN_RUNNING_TIME_HOURS = int(os.environ.get('MIN_RUNNING_TIME_HOURS', 8))
+          NOTIFICATION_TIME_HOURS = int(os.environ.get('NOTIFICATION_TIME_HOURS', 4))
+          SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+          EXCLUDE_STRING = os.environ.get('EXCLUDE_STRING', 'do-not-delete')
+          FORCE_DELETE = os.environ.get('FORCE_DELETE', 'false').lower() == 'true'
+
+
+          def handle_custom_resource(event, context):
+              """Handle CloudFormation custom resource events"""
+              try:
+                  print("Custom Resource Event:")
+                  print(json.dumps(event, indent=2))
+                  
+                  request_type = event['RequestType']
+                  physical_id = event.get('PhysicalResourceId', '')
+                  stack_id = event['StackId']
+                  
+                  print(f"Request Type: {request_type}")
+                  print(f"Physical ID: {physical_id}")
+                  print(f"Stack ID: {stack_id}")
+                  
+                  if request_type == 'Delete':
+                      return {
+                          'Status': 'SUCCESS',
+                          'PhysicalResourceId': physical_id,
+                          'StackId': stack_id,
+                          'RequestId': event['RequestId'],
+                          'LogicalResourceId': event['LogicalResourceId']
+                      }
+              except Exception as e:
+                  print(f"Error handling custom resource: {e}")
+                  return {
+                      'Status': 'FAILED',
+                      'Reason': str(e)
+                  }
+
+
+          def push_metrics(metric_name, value, additional_dimensions=None):
+              """Push metrics to CloudWatch"""
+              try:
+                  metric_data = {
+                      'MetricName': metric_name,
+                      'Value': value,
+                      'Unit': 'Count',
+                      'Timestamp': datetime.datetime.now()
+                  }
+                  
+                  if additional_dimensions:
+                      metric_data['Dimensions'] = additional_dimensions
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace='ResourceCleaner',
+                      MetricData=[metric_data]
+                  )
+              except Exception as e:
+                  print(f"Error pushing metrics: {e}")
+
+
+          def estimate_volume_cost_savings(volume):
+              """Estimate monthly cost savings for an EBS volume"""
+              prices = {
+                  'gp2': 0.10,
+                  'gp3': 0.08,
+                  'io1': 0.125,
+                  'io2': 0.125,
+                  'st1': 0.045,
+                  'sc1': 0.025,
+                  'standard': 0.05
+              }
+              
+              volume_type = volume['VolumeType']
+              size = volume['Size']
+              return prices.get(volume_type, 0.10) * size
+
+
+          def is_snapshot_in_use(snapshot_id):
+              """Check if a snapshot is in use"""
+              try:
+                  # Check if snapshot is used by any AMIs
+                  amis = ec2_client.describe_images(
+                      Filters=[{'Name': 'block-device-mapping.snapshot-id', 'Values': [snapshot_id]}]
+                  )
+                  if amis['Images']:
+                      ami_ids = [ami['ImageId'] for ami in amis['Images']]
+                      print(f"Snapshot {snapshot_id} is used by AMIs: {ami_ids}")
+                      return True
+                  
+                  # Check if snapshot is referenced by other snapshots
+                  snapshots = ec2_client.describe_snapshots(
+                      Filters=[{'Name': 'parent-snapshot-id', 'Values': [snapshot_id]}]
+                  )
+                  if snapshots['Snapshots']:
+                      child_ids = [snap['SnapshotId'] for snap in snapshots['Snapshots']]
+                      print(f"Snapshot {snapshot_id} has dependent snapshots: {child_ids}")
+                      return True
+                  
+                  return False
+              except ClientError as e:
+                  print(f"Error checking snapshot usage {snapshot_id}: {e}")
+                  return True
+
+
+          def cleanup_elastic_ips():
+              """Clean up unassociated Elastic IPs"""
+              eips_released = 0
+              protected_eips = 0
+              
+              try:
+                  response = ec2_client.describe_addresses()
+                  
+                  for eip in response['Addresses']:
+                      allocation_id = eip.get('AllocationId')
+                      public_ip = eip.get('PublicIp', 'Unknown')
+                      
+                      if not allocation_id:
+                          print(f"Skipping EC2-Classic IP: {public_ip}")
+                          continue
+                      
+                      # Check protection via tags
+                      if any(tag['Key'].lower() == 'name' and EXCLUDE_STRING.lower() in tag['Value'].lower() 
+                             for tag in eip.get('Tags', [])):
+                          protected_eips += 1
+                          print(f"Skipping protected Elastic IP: {public_ip} ({allocation_id})")
+                          continue
+                      
+                      # Only process unassociated IPs
+                      if 'InstanceId' not in eip:
+                          try:
+                              print(f"Releasing unassociated Elastic IP: {public_ip} ({allocation_id})")
+                              ec2_client.release_address(AllocationId=allocation_id)
+                              eips_released += 1
+                          except ClientError as e:
+                              print(f"Error releasing Elastic IP {public_ip} ({allocation_id}): {e}")
+                              push_metrics('FailedDeletions', 1, [{'Name': 'ResourceType', 'Value': 'ElasticIP'}])
+                      else:
+                          print(f"Skipping associated Elastic IP: {public_ip} (Instance: {eip['InstanceId']})")
+              
+              except ClientError as e:
+                  print(f"Error describing Elastic IPs: {e}")
+              
+              push_metrics('ReleasedElasticIPs', eips_released)
+              push_metrics('ProtectedElasticIPs', protected_eips)
+              return eips_released
+
+
+          def cleanup_ec2_instances():
+              """Clean up EC2 instances in all states (pending, running, stopping, stopped)"""
+              instances_terminated = 0
+              protected_instances = 0
+              
+              try:
+                  # Get all instances except already terminated or shutting-down
+                  response = ec2_client.describe_instances(
+                      Filters=[{'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}]
+                  )
+                  
+                  for reservation in response['Reservations']:
+                      for instance in reservation['Instances']:
+                          instance_id = instance['InstanceId']
+                          instance_name = 'N/A'
+                          instance_state = instance['State']['Name']
+                          is_protected = False
+                          
+                          # Get instance name from tags and check protection
+                          for tag in instance.get('Tags', []):
+                              if tag['Key'] == 'Name':
+                                  instance_name = tag['Value']
+                              # Check protection via tags
+                              if tag['Key'].lower() == 'name' and EXCLUDE_STRING.lower() in tag['Value'].lower():
+                                  is_protected = True
+                                  break
+                          
+                          if is_protected:
+                              protected_instances += 1
+                              print(f"Skipping protected instance: {instance_id} ({instance_name}) - State: {instance_state}")
+                              continue
+                          
+                          # Calculate running time
+                          launch_time = instance['LaunchTime'].replace(tzinfo=None)
+                          current_time = datetime.datetime.utcnow()
+                          running_time = current_time - launch_time
+                          
+                          # Terminate if FORCE_DELETE is enabled OR running longer than configured time
+                          should_terminate = FORCE_DELETE or running_time >= datetime.timedelta(hours=MIN_RUNNING_TIME_HOURS)
+                          
+                          if should_terminate:
+                              try:
+                                  reason = "FORCE_DELETE enabled" if FORCE_DELETE else "Age: " + str(running_time)
+                                  print(f"Terminating instance: {instance_id} ({instance_name}) - State: {instance_state} - Reason: {reason}")
+                                  ec2_client.terminate_instances(InstanceIds=[instance_id])
+                                  instances_terminated += 1
+                              except ClientError as e:
+                                  print(f"Error terminating instance {instance_id}: {e}")
+                                  push_metrics('FailedDeletions', 1, [{'Name': 'ResourceType', 'Value': 'EC2Instance'}])
+                          else:
+                              print(f"Instance {instance_id} ({instance_name}) - State: {instance_state} - Age: {running_time} - not old enough")
+              
+              except ClientError as e:
+                  print(f"Error describing EC2 instances: {e}")
+              
+              push_metrics('TerminatedInstances', instances_terminated)
+              push_metrics('ProtectedInstances', protected_instances)
+              return instances_terminated
+
+
+          def cleanup_ebs_volumes():
+              """Clean up unused EBS volumes"""
+              volumes_deleted = 0
+              protected_volumes = 0
+              age_buckets = {'0-7': 0, '8-30': 0, '31-90': 0, '90+': 0}
+              
+              paginator = ec2_client.get_paginator('describe_volumes')
+              
+              for page in paginator.paginate(Filters=[{'Name': 'status', 'Values': ['available']}]):
+                  for volume in page['Volumes']:
+                      volume_id = volume['VolumeId']
+                      
+                      # Check protection
+                      if any(tag['Key'].lower() == 'name' and EXCLUDE_STRING.lower() in tag['Value'].lower() 
+                             for tag in volume.get('Tags', [])):
+                          protected_volumes += 1
+                          print(f"Skipping protected volume: {volume_id}")
+                          continue
+                      
+                      volume_age = datetime.datetime.now(datetime.timezone.utc) - volume['CreateTime']
+                      age_days = volume_age.days
+                      
+                      # Update age buckets
+                      if age_days <= 7:
+                          age_buckets['0-7'] += 1
+                      elif age_days <= 30:
+                          age_buckets['8-30'] += 1
+                      elif age_days <= 90:
+                          age_buckets['31-90'] += 1
+                      else:
+                          age_buckets['90+'] += 1
+                      
+                      try:
+                          print(f"Deleting EBS volume: {volume_id}")
+                          ec2_client.delete_volume(VolumeId=volume_id)
+                          volumes_deleted += 1
+                      except ClientError as e:
+                          print(f"Error deleting volume {volume_id}: {e}")
+                          push_metrics('FailedDeletions', 1, [{'Name': 'ResourceType', 'Value': 'Volume'}])
+              
+              push_metrics('DeletedVolumes', volumes_deleted)
+              push_metrics('ProtectedVolumes', protected_volumes)
+              
+              for age_range, count in age_buckets.items():
+                  push_metrics('VolumeAgeDistribution', count, [{'Name': 'AgeRange', 'Value': age_range}])
+              
+              return volumes_deleted
+
+
+          def cleanup_s3_buckets():
+              """Clean up S3 buckets older than configured time"""
+              s3 = boto3.client('s3')
+              buckets_deleted = 0
+              protected_buckets = 0
+              
+              try:
+                  response = s3.list_buckets()
+                  
+                  for bucket in response['Buckets']:
+                      bucket_name = bucket['Name']
+                      
+                      # Check protection via tags
+                      try:
+                          tags_response = s3.get_bucket_tagging(Bucket=bucket_name)
+                          tags = tags_response.get('TagSet', [])
+                          
+                          if any(tag['Key'].lower() == 'name' and EXCLUDE_STRING.lower() in tag['Value'].lower() for tag in tags):
+                              protected_buckets += 1
+                              print(f"Skipping protected bucket: {bucket_name}")
+                              continue
+                      except ClientError as e:
+                          if e.response['Error']['Code'] != 'NoSuchTagSet':
+                              print(f"Error getting tags for bucket {bucket_name}: {e}")
+                      
+                      # Check bucket age
+                      bucket_age = datetime.datetime.now(datetime.timezone.utc) - bucket['CreationDate'].replace(tzinfo=datetime.timezone.utc)
+                      
+                      if bucket_age >= datetime.timedelta(hours=MIN_RUNNING_TIME_HOURS):
+                          try:
+                              print(f"Emptying and deleting bucket: {bucket_name} (Age: {bucket_age})")
+                              
+                              # Empty bucket first
+                              empty_s3_bucket(bucket_name)
+                              
+                              # Delete bucket
+                              s3.delete_bucket(Bucket=bucket_name)
+                              buckets_deleted += 1
+                              print(f"Successfully deleted bucket: {bucket_name}")
+                          except ClientError as e:
+                              print(f"Error deleting bucket {bucket_name}: {e}")
+                              push_metrics('FailedDeletions', 1, [{'Name': 'ResourceType', 'Value': 'S3Bucket'}])
+                      else:
+                          print(f"Bucket {bucket_name} is {bucket_age} old - not old enough")
+              
+              except ClientError as e:
+                  print(f"Error listing S3 buckets: {e}")
+              
+              push_metrics('DeletedS3Buckets', buckets_deleted)
+              push_metrics('ProtectedS3Buckets', protected_buckets)
+              return buckets_deleted
+
+
+          def cleanup_snapshots():
+              """Clean up EBS snapshots"""
+              snapshots_deleted = 0
+              protected_snapshots = 0
+              age_buckets = {'0-7': 0, '8-30': 0, '31-90': 0, '90+': 0}
+              
+              account_id = boto3.client('sts').get_caller_identity().get('Account')
+              paginator = ec2_client.get_paginator('describe_snapshots')
+              
+              for page in paginator.paginate(OwnerIds=[account_id]):
+                  for snapshot in page['Snapshots']:
+                      snapshot_id = snapshot['SnapshotId']
+                      
+                      # Check protection
+                      if any(tag['Key'].lower() == 'name' and EXCLUDE_STRING.lower() in tag['Value'].lower() 
+                             for tag in snapshot.get('Tags', [])):
+                          protected_snapshots += 1
+                          print(f"Skipping protected snapshot: {snapshot_id}")
+                          continue
+                      
+                      snapshot_age = datetime.datetime.now(datetime.timezone.utc) - snapshot['StartTime']
+                      age_days = snapshot_age.days
+                      
+                      # Update age buckets
+                      if age_days <= 7:
+                          age_buckets['0-7'] += 1
+                      elif age_days <= 30:
+                          age_buckets['8-30'] += 1
+                      elif age_days <= 90:
+                          age_buckets['31-90'] += 1
+                      else:
+                          age_buckets['90+'] += 1
+                      
+                      if snapshot_age > datetime.timedelta(days=7):
+                          if is_snapshot_in_use(snapshot_id):
+                              print(f"Snapshot {snapshot_id} is in use, skipping")
+                              continue
+                          
+                          try:
+                              print(f"Deleting snapshot: {snapshot_id}")
+                              ec2_client.delete_snapshot(SnapshotId=snapshot_id)
+                              snapshots_deleted += 1
+                          except ClientError as e:
+                              print(f"Error deleting snapshot {snapshot_id}: {e}")
+                              push_metrics('FailedDeletions', 1, [{'Name': 'ResourceType', 'Value': 'Snapshot'}])
+              
+              push_metrics('DeletedSnapshots', snapshots_deleted)
+              push_metrics('ProtectedSnapshots', protected_snapshots)
+              
+              for age_range, count in age_buckets.items():
+                  push_metrics('SnapshotAgeDistribution', count, [{'Name': 'AgeRange', 'Value': age_range}])
+              
+              return snapshots_deleted
+
+
+          def empty_s3_bucket(bucket_name):
+              """Empty all objects and versions in an S3 bucket"""
+              s3 = boto3.client('s3')
+              
+              try:
+                  print(f"Emptying bucket (without deleting): {bucket_name}")
+                  paginator = s3.get_paginator('list_object_versions')
+                  
+                  for page in paginator.paginate(Bucket=bucket_name):
+                      objects = []
+                      
+                      for version in page.get('Versions', []):
+                          objects.append({'Key': version['Key'], 'VersionId': version['VersionId']})
+                      
+                      for marker in page.get('DeleteMarkers', []):
+                          objects.append({'Key': marker['Key'], 'VersionId': marker['VersionId']})
+                      
+                      if objects:
+                          print(f"Deleting {len(objects)} objects from {bucket_name}")
+                          s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+              
+              except ClientError as e:
+                  print(f"Error emptying bucket {bucket_name}: {e}")
+
+
+          def cleanup_stack_resources(stack_name):
+              """Clean up resources associated with a stack before deletion"""
+              try:
+                  response = cf_client.describe_stack_resources(StackName=stack_name)
+                  s3_buckets = []
+                  
+                  # Identify all S3 buckets
+                  for resource in response['StackResources']:
+                      if resource['ResourceType'] == 'AWS::S3::Bucket':
+                          bucket_name = resource['PhysicalResourceId']
+                          s3_buckets.append(bucket_name)
+                          print(f"Found S3 bucket in stack: {bucket_name}")
+                  
+                  # Empty each bucket with retries
+                  for bucket_name in s3_buckets:
+                      for attempt in range(3):
+                          try:
+                              print(f"Attempt {attempt + 1} to empty bucket {bucket_name}")
+                              empty_s3_bucket(bucket_name)
+                              print(f"Successfully emptied bucket {bucket_name}")
+                              break
+                          except ClientError as e:
+                              print(f"Error emptying bucket {bucket_name} on attempt {attempt + 1}: {e}")
+                              if attempt < 2:
+                                  time.sleep(5)
+                              else:
+                                  print(f"Failed to empty bucket {bucket_name} after 3 attempts")
+              
+              except ClientError as e:
+                  print(f"Error cleaning up stack resources for {stack_name}: {e}")
+
+
+          def disable_termination_protection(stack_name):
+              """Disable termination protection if enabled"""
+              try:
+                  cf_client.update_termination_protection(
+                      StackName=stack_name,
+                      EnableTerminationProtection=False
+                  )
+                  print(f"Disabled termination protection for stack: {stack_name}")
+                  return True
+              except ClientError as e:
+                  print(f"Error disabling termination protection for {stack_name}: {e}")
+                  return False
+
+
+          def is_stack_protected(stack_name):
+              """Check if stack has termination protection enabled"""
+              try:
+                  response = cf_client.describe_stacks(StackName=stack_name)
+                  if response['Stacks']:
+                      return response['Stacks'][0].get('EnableTerminationProtection', False)
+              except Exception as e:
+                  print(f"Error checking termination protection for stack {stack_name}: {e}")
+                  return True
+              
+              return False
+
+
+          def lambda_handler(event, context):
+              """Main Lambda handler function"""
+              # Check if this is a custom resource event
+              if event.get('ResourceType', '').startswith('Custom::') or 'RequestType' in event:
+                  return handle_custom_resource(event, context)
+              
+              current_time_utc = datetime.datetime.utcnow()
+              stacks_processed = False
+              stacks_deleted = 0
+              stacks_protected = 0
+              stacks_notification_sent = 0
+              failed_deletions = 0
+              
+              # Track deleted resources by name/ID
+              deleted_stacks = []
+              deleted_instances = []
+              deleted_buckets = []
+              deleted_volumes = []
+              deleted_snapshots = []
+              deleted_eips = []
+              
+              # Get current stack name to avoid self-deletion
+              current_stack_name = os.environ.get('AWS_LAMBDA_FUNCTION_NAME', '')
+              
+              # Process CloudFormation stacks
+              response = cf_client.describe_stacks()
+              
+              for stack in response['Stacks']:
+                  stack_name = stack['StackName']
+                  
+                  # Never delete this cleanup stack itself
+                  if any(keyword in stack_name.lower() for keyword in ['resourcecleanup', 'resource-cleanup', 'cleaner', 'cleanup-stack']):
+                      stacks_protected += 1
+                      print(f"Skipping cleanup stack itself: {stack_name}")
+                      continue
+                  
+                  # Check name-based protection
+                  if EXCLUDE_STRING.lower() in stack_name.lower():
+                      stacks_protected += 1
+                      print(f"Skipping protected stack (name): {stack_name}")
+                      continue
+                  
+                  # Check termination protection
+                  if is_stack_protected(stack_name):
+                      stacks_protected += 1
+                      print(f"Skipping protected stack (termination protection): {stack_name}")
+                      continue
+                  
+                  stacks_processed = True
+                  creation_time_utc = stack['CreationTime'].replace(tzinfo=None)
+                  running_time = current_time_utc - creation_time_utc
+                  
+                  # Send notification before deletion
+                  # Notification window: between (MIN_RUNNING_TIME - NOTIFICATION_TIME) and MIN_RUNNING_TIME
+                  notification_start = datetime.timedelta(hours=MIN_RUNNING_TIME_HOURS - NOTIFICATION_TIME_HOURS)
+                  deletion_time = datetime.timedelta(hours=MIN_RUNNING_TIME_HOURS)
+                  
+                  if notification_start <= running_time < deletion_time:
+                      time_remaining = deletion_time - running_time
+                      
+                      # Check if notification already sent (via stack tag)
+                      stack_tags = {tag['Key']: tag['Value'] for tag in stack.get('Tags', [])}
+                      if stack_tags.get('CleanupWarningNotified') == 'true':
+                          print(f"Warning already sent for stack: {stack_name}")
+                          continue
+                      
+                      try:
+                          # Check if stack still exists
+                          cf_client.describe_stacks(StackName=stack_name)
+                          
+                          message = f'''Stack "{stack_name}" scheduled for deletion in approximately {time_remaining.total_seconds() // 3600:.0f} hours.
+
+          Region: {os.environ.get("AWS_REGION", "unknown")}
+          Creation Time: {stack['CreationTime']}
+          Running Time: {running_time}
+          
+          To protect this stack, add tag Name={EXCLUDE_STRING} or enable termination protection.'''
+                          
+                          sns_client.publish(
+                              TopicArn=SNS_TOPIC_ARN,
+                              Message=message,
+                              Subject=f'[{os.environ.get("AWS_REGION", "unknown")}] Stack Deletion Warning: {stack_name}'
+                          )
+                          
+                          # Tag stack to prevent duplicate notifications
+                          try:
+                              cf_client.update_stack(
+                                  StackName=stack_name,
+                                  UsePreviousTemplate=True,
+                                  Tags=stack.get('Tags', []) + [{'Key': 'CleanupWarningNotified', 'Value': 'true'}]
+                              )
+                          except Exception as tag_error:
+                              print(f"Could not tag stack {stack_name}: {tag_error}")
+                          
+                          stacks_notification_sent += 1
+                          print(f"Warning notification sent for stack: {stack_name}")
+                      except ClientError as e:
+                          if e.response['Error']['Code'] != 'ValidationError':
+                              print(f"Error sending notification for {stack_name}: {e}")
+                  
+                  # Delete stack if running time exceeded
+                  if running_time >= datetime.timedelta(hours=MIN_RUNNING_TIME_HOURS):
+                      try:
+                          print(f"Cleaning up resources for stack: {stack_name}")
+                          
+                          # Step 1: Clean up S3 buckets
+                          cleanup_stack_resources(stack_name)
+                          
+                          # Step 2: Handle known problematic S3 buckets
+                          try:
+                              resources = cf_client.describe_stack_resources(StackName=stack_name)['StackResources']
+                              for resource in resources:
+                                  if resource['LogicalResourceId'] in ['S3ContentLogo', 'S3ContentStyle', 
+                                                                        'S3ContentFavicon', 'S3ContentScript', 
+                                                                        'S3ContentHome']:
+                                      if resource['ResourceType'] == 'AWS::S3::Bucket':
+                                          bucket_name = resource['PhysicalResourceId']
+                                          print(f"Emptying special bucket before stack delete: {bucket_name}")
+                                          empty_s3_bucket(bucket_name)
+                          except Exception as e:
+                              print(f"Error handling special buckets: {e}")
+                          
+                          # Step 3: Disable termination protection if enabled
+                          if is_stack_protected(stack_name):
+                              print(f"Stack {stack_name} has termination protection, attempting to disable...")
+                              disable_termination_protection(stack_name)
+                              time.sleep(2)  # Wait for protection to be disabled
+                          
+                          # Step 4: Delete the stack
+                          print(f"Deleting stack: {stack_name}")
+                          cf_client.delete_stack(StackName=stack_name)
+                          stacks_deleted += 1
+                          deleted_stacks.append(stack_name)
+                          print(f"Successfully initiated deletion for stack: {stack_name}")
+                      except ClientError as e:
+                          failed_deletions += 1
+                          error_code = e.response['Error']['Code']
+                          error_msg = e.response['Error']['Message']
+                          print(f"Error deleting stack {stack_name}: [{error_code}] {error_msg}")
+                          
+                          # Log specific error types
+                          if 'does not exist' in error_msg.lower():
+                              print(f"Stack {stack_name} no longer exists")
+                          elif 'cannot be deleted' in error_msg.lower():
+                              print(f"Stack {stack_name} cannot be deleted - may have dependencies")
+                          elif 'bucket' in error_msg.lower():
+                              print(f"Stack {stack_name} failed due to S3 bucket issue")
+                          
+                          push_metrics('FailedDeletions', 1, [{'Name': 'ResourceType', 'Value': 'Stack'}])
+                      except Exception as e:
+                          failed_deletions += 1
+                          print(f"Unexpected error deleting stack {stack_name}: {e}")
+                          push_metrics('FailedDeletions', 1, [{'Name': 'ResourceType', 'Value': 'Stack'}])
+              
+              # Push stack metrics
+              push_metrics('DeletedStacks', stacks_deleted)
+              push_metrics('ProtectedStacks', stacks_protected)
+              push_metrics('StackNotifications', stacks_notification_sent)
+              
+              # Clean up volumes, snapshots, Elastic IPs, EC2 instances, and S3 buckets
+              volumes_deleted = cleanup_ebs_volumes()
+              snapshots_deleted = cleanup_snapshots()
+              eips_released = cleanup_elastic_ips()
+              instances_terminated = cleanup_ec2_instances()
+              buckets_deleted = cleanup_s3_buckets()
+              
+              # Send summary notification if any resources were deleted
+              if volumes_deleted > 0 or snapshots_deleted > 0 or eips_released > 0 or stacks_deleted > 0 or instances_terminated > 0 or buckets_deleted > 0:
+                  try:
+                      current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                      current_region = os.environ.get("AWS_REGION", "us-east-1")
+                      total_deleted = instances_terminated + volumes_deleted + snapshots_deleted + eips_released + stacks_deleted + buckets_deleted
+                      
+                      summary_lines = []
+                      summary_lines.append('AWS Resource Cleanup Summary')
+                      summary_lines.append('')
+                      summary_lines.append('Region: ' + current_region)
+                      summary_lines.append('Execution Time: ' + current_time)
+                      summary_lines.append('')
+                      summary_lines.append('RESOURCES DELETED:')
+                      summary_lines.append('- CloudFormation Stacks: ' + str(stacks_deleted))
+                      if deleted_stacks:
+                          for stack in deleted_stacks[:10]:  # Limit to first 10
+                              summary_lines.append('  * ' + stack)
+                          if len(deleted_stacks) > 10:
+                              summary_lines.append('  * ... and ' + str(len(deleted_stacks) - 10) + ' more')
+                      summary_lines.append('- EC2 Instances: ' + str(instances_terminated))
+                      summary_lines.append('- S3 Buckets: ' + str(buckets_deleted))
+                      summary_lines.append('- EBS Volumes: ' + str(volumes_deleted))
+                      summary_lines.append('- EBS Snapshots: ' + str(snapshots_deleted))
+                      summary_lines.append('- Elastic IPs: ' + str(eips_released))
+                      summary_lines.append('')
+                      summary_lines.append('RESOURCES PROTECTED:')
+                      summary_lines.append('- CloudFormation Stacks: ' + str(stacks_protected))
+                      summary_lines.append('')
+                      summary_lines.append('NOTIFICATIONS SENT:')
+                      summary_lines.append('- Stack Deletion Warnings: ' + str(stacks_notification_sent))
+                      summary_lines.append('')
+                      summary_lines.append('FAILED OPERATIONS:')
+                      summary_lines.append('- Failed Deletions: ' + str(failed_deletions))
+                      summary_lines.append('')
+                      summary_lines.append('View detailed logs in CloudWatch: /aws/lambda/ResourceCleanupFunction')
+                      
+                      summary_message = chr(10).join(summary_lines)
+                      subject_line = '[' + current_region + '] AWS Cleanup: ' + str(total_deleted) + ' Resources Deleted'
+                      
+                      sns_client.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Message=summary_message,
+                          Subject=subject_line
+                      )
+                      print("Summary notification sent")
+                  except Exception as e:
+                      error_msg = "Error sending summary notification: " + str(e)
+                      print(error_msg)
+              
+              # Return results
+              response_body = {
+                  'stacks_deleted': stacks_deleted,
+                  'stacks_protected': stacks_protected,
+                  'notifications_sent': stacks_notification_sent,
+                  'instances_terminated': instances_terminated,
+                  'buckets_deleted': buckets_deleted,
+                  'volumes_deleted': volumes_deleted,
+                  'snapshots_deleted': snapshots_deleted,
+                  'eips_released': eips_released,
+                  'failed_deletions': failed_deletions
+              }
+              
+              return {
+                  'statusCode': 200,
+                  'body': str(response_body)
+              }
+
+  # EventBridge Rule for scheduled execution
+  CleanupScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ResourceCleanupSchedule
+      Description: Trigger resource cleanup Lambda function on schedule
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Tags:
+        - Key: ResourceName
+          Value: !Sub '${AWS::StackName}-${ExcludeString}'
+        - Key: Purpose
+          Value: 'AWS Resource Cleanup Scheduler'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+      Targets:
+        - Arn: !GetAtt ResourceCleanupFunction.Arn
+          Id: ResourceCleanupTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ResourceCleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupScheduleRule.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Resource Cleanup Lambda Function
+    Value: !GetAtt ResourceCleanupFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+  
+  SNSTopicArn:
+    Description: ARN of the SNS Topic for notifications
+    Value: !Ref CleanupNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+  
+  ScheduleRuleArn:
+    Description: ARN of the EventBridge Schedule Rule
+    Value: !GetAtt CleanupScheduleRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRuleArn'
